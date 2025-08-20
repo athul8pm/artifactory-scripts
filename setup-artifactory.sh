@@ -7,10 +7,14 @@ if [ -z "$CONFIG_FILE" ]; then
   exit 1
 fi
 
-
-GENERIC_REPO=$(grep '^generic_repo=' "$CONFIG_FILE" | cut -d'=' -f2)
 ENV=$(grep '^env=' "$CONFIG_FILE" | cut -d'=' -f2)
+GENERIC_REPO=$(grep '^generic_repo=' "$CONFIG_FILE" | cut -d'=' -f2)
 
+CREATE_USER=$(grep '^create_user=' "$CONFIG_FILE" | cut -d'=' -f2)
+CREATE_GROUP=$(grep '^create_group=' "$CONFIG_FILE" | cut -d'=' -f2)
+CREATE_PERMISSION=$(grep '^create_permission=' "$CONFIG_FILE" | cut -d'=' -f2)
+CREATE_REPO=$(grep '^create_repo=' "$CONFIG_FILE" | cut -d'=' -f2)
+CREATE_FOLDERS=$(grep '^create_folders=' "$CONFIG_FILE" | cut -d'=' -f2)
 
 case "$ENV" in
   dev)
@@ -28,14 +32,12 @@ case "$ENV" in
     ;;
 esac
 
-
 read -s -p "Enter Artifactory Bearer Token: " BEARER_TOKEN
 echo
 
 # ---------------------------------------------
 # Functions
 # ---------------------------------------------
-
 handle_response() {
   local HTTP_CODE=$1
   local MSG=$2
@@ -65,10 +67,12 @@ create_user() {
   local USERNAME=$1
   local EMAIL=$2
   local PASSWORD=$3
+  local GROUP=$4
+
   echo "Creating user: $USERNAME ($EMAIL) ..."
 
-  # Check if user exists
-  EXISTING=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $BEARER_TOKEN" \
+  EXISTING=$(curl -s -o /dev/null -w "%{http_code}" \
+       -H "Authorization: Bearer $BEARER_TOKEN" \
        "$ARTIFACTORY_URL/access/api/v2/users/$USERNAME")
 
   if [[ "$EXISTING" == "200" ]]; then
@@ -77,7 +81,12 @@ create_user() {
     RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
        -H "Content-Type: application/json" \
        -H "Authorization: Bearer $BEARER_TOKEN" \
-       -d "{\"username\":\"$USERNAME\",\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}" \
+       -d "{
+             \"username\": \"$USERNAME\",
+             \"email\": \"$EMAIL\",
+             \"password\": \"$PASSWORD\",
+             \"groups\": [\"$GROUP\"]
+           }" \
        "$ARTIFACTORY_URL/access/api/v2/users")
     handle_response $RESPONSE "Create user $USERNAME"
     echo "User $USERNAME setup done."
@@ -86,6 +95,16 @@ create_user() {
 
 create_repo() {
   local KEY=$1
+  echo "Checking if repo $KEY exists ..."
+
+  EXISTING=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $BEARER_TOKEN" \
+    "$ARTIFACTORY_URL/artifactory/api/repositories/$KEY")
+
+  if [[ "$EXISTING" == "200" ]]; then
+    echo "Repo $KEY already exists. Skipping."
+    return
+  fi
+
   echo "Creating generic repo: $KEY ..."
   RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
        -H "Content-Type: application/json" \
@@ -95,6 +114,7 @@ create_repo() {
              "packageType": "generic"
            }' \
        "$ARTIFACTORY_URL/artifactory/api/repositories/$KEY")
+
   handle_response $RESPONSE "Create repo $KEY"
   echo "Repo $KEY created."
 }
@@ -103,23 +123,64 @@ create_permission() {
   local PERM_KEY=$1
   local REPO=$2
   local PATTERN=$3
-  local GROUPS=$4
-  echo "Creating permission: $PERM_KEY for $REPO ($PATTERN)..."
+  local GROUP=$4
+  local ACCESS=$5
 
-  local PERM_JSON="{\"name\":\"$PERM_KEY\",\"repositories\":[\"$REPO\"],\"principals\":{\"groups\":{"
-  for g in ${GROUPS//,/ }; do
-    PERM_JSON="$PERM_JSON\"$g\":[{\"actions\":[\"read\",\"deploy\"]}],"
+  IFS=',' read -ra ACTIONS <<< "$ACCESS"
+  ACTIONS_JSON="["
+  for a in "${ACTIONS[@]}"; do
+    ACTIONS_JSON+="\"$a\","
   done
-  PERM_JSON="${PERM_JSON%,*}}}}"
+  ACTIONS_JSON="${ACTIONS_JSON%,}]"
 
-  RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+  echo "Creating permission: $PERM_KEY for $REPO ($PATTERN) for group $GROUP with actions $ACCESS..."
+
+  local PERM_JSON=$(cat <<EOF
+{
+  "name": "$PERM_KEY",
+  "resources": {
+    "artifact": {
+      "actions": {
+        "users": {},
+        "groups": {
+          "$GROUP": $ACTIONS_JSON
+        }
+      },
+      "targets": {
+        "$REPO": {
+          "include_patterns": ["$PATTERN"],
+          "exclude_patterns": []
+        }
+      }
+    },
+    "release_bundle": {
+      "actions": {"users": {}, "groups": {}},
+      "targets": {}
+    },
+    "build": {
+      "actions": {"users": {}, "groups": {}},
+      "targets": {}
+    }
+  }
+}
+EOF
+)
+
+  RESPONSE=$(curl -s \
+       -X POST \
        -H "Content-Type: application/json" \
        -H "Authorization: Bearer $BEARER_TOKEN" \
        -d "$PERM_JSON" \
-       "$ARTIFACTORY_URL/artifactory/api/v2/security/permissions/$PERM_KEY")
-  handle_response $RESPONSE "Create permission $PERM_KEY"
-  echo "Permission $PERM_KEY created."
+       "$ARTIFACTORY_URL/access/api/v2/permissions")
+
+  if echo "$RESPONSE" | grep -q '"errors"'; then
+    echo "ERROR creating permission $PERM_KEY: $RESPONSE"
+  else
+    echo "Permission $PERM_KEY created successfully."
+  fi
 }
+
+
 
 create_folder_with_readme() {
   local REPO=$1
@@ -144,28 +205,39 @@ create_folder_with_readme() {
 echo "Starting Artifactory setup for repo $GENERIC_REPO in $ENV environment..."
 
 # Groups
-for g in $(grep '^groups=' "$CONFIG_FILE" | cut -d'=' -f2 | tr ',' ' '); do
-  create_group "$g"
-done
+if [[ "$CREATE_GROUP" == "y" ]]; then
+  for g in $(grep '^groups=' "$CONFIG_FILE" | cut -d'=' -f2 | tr ',' ' '); do
+    create_group "$g"
+  done
+fi
 
 # Users
-while IFS= read -r u; do
-  IFS='|' read -ra FIELDS <<< "$u"
-  create_user "${FIELDS[0]}" "${FIELDS[1]}" "${FIELDS[2]}"
+if [[ "$CREATE_USER" == "y" ]]; then
+  while IFS= read -r u; do
+    IFS='|' read -ra FIELDS <<< "$u"
+  create_user "${FIELDS[0]}" "${FIELDS[1]}" "${FIELDS[2]}" "${FIELDS[3]}"
 done <<< "$(grep '^users=' "$CONFIG_FILE" | cut -d'=' -f2-)"
 
+fi
+
 # Repo
-create_repo "$GENERIC_REPO"
+if [[ "$CREATE_REPO" == "y" ]]; then
+  create_repo "$GENERIC_REPO"
+fi
 
 # Permissions
-#while IFS= read -r p; do
-#  IFS='|' read -ra FIELDS <<< "$p"
-#  create_permission "${FIELDS[0]}" "${FIELDS[1]}" "${FIELDS[2]}" "${FIELDS[3]}"
-#done <<< "$(grep '^permissions=' "$CONFIG_FILE" | cut -d'=' -f2-)"
+if [[ "$CREATE_PERMISSION" == "y" ]]; then
+  while IFS= read -r p; do
+    IFS='|' read -ra FIELDS <<< "$p"
+    create_permission "${FIELDS[0]}" "${FIELDS[1]}" "${FIELDS[2]}" "${FIELDS[3]}" "${FIELDS[4]}"
+  done <<< "$(grep '^permissions=' "$CONFIG_FILE" | cut -d'=' -f2-)"
+fi
 
 # Folders
-for f in $(grep '^folders=' "$CONFIG_FILE" | cut -d'=' -f2 | tr ',' ' '); do
-  create_folder_with_readme "$GENERIC_REPO" "$f"
-done
+if [[ "$CREATE_FOLDERS" == "y" ]]; then
+  for f in $(grep '^folders=' "$CONFIG_FILE" | cut -d'=' -f2 | tr ',' ' '); do
+    create_folder_with_readme "$GENERIC_REPO" "$f"
+  done
+fi
 
 echo "Setup completed successfully."
